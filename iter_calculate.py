@@ -1,9 +1,16 @@
 import os
+import math
 import shutil
 
 
-class AbaqusINPModel(object):
+class AbaqusModel(object):
+    def __init__(self):
+        self.keygen = IdGenerator()
+
+
+class AbaqusINPModel(AbaqusModel):
     def __init__(self, inp_filepath):
+        super(AbaqusINPModel, self).__init__()
         self._inp_filepath = inp_filepath
         self._new_inp_filepath = None
         self._new_odb_filepath = None
@@ -58,14 +65,14 @@ class AbaqusINPModel(object):
                         continue
                     if node_flag:
                         node_id = line.split(',')[0]
-                        inst_name = part_name + '-1'
-                        node_data = node_coors_dict.get((inst_name, node_id), None)
+                        inst_name = part_name + '-1'  # just a part vs a instance
+                        node_data = node_coors_dict.get(self.keygen.get_id((inst_name, node_id)), None)
                         if node_data is None:
                             continue
-                        new_node_id = node_data[0]
-                        new_node_x = node_data[1]
-                        new_node_y = node_data[2]
-                        new_node_z = node_data[3]
+                        new_node_id = node_data.id
+                        new_node_x = node_data.x
+                        new_node_y = node_data.y
+                        new_node_z = node_data.z
                         fp_writer.write('%s,    %f,    %f,    %f' % (new_node_id, new_node_x, new_node_y, new_node_z))
                         fp_writer.write('\n')
                     else:
@@ -73,6 +80,7 @@ class AbaqusINPModel(object):
                         fp_writer.write('\n')
         print "Finish generating inp file %s" % inp_name
 
+    # to do
     def get_inp_node_coors_dict(self):
         node_flag = False
         inp_node_coors_dict = dict()
@@ -85,7 +93,6 @@ class AbaqusINPModel(object):
                 if line.startswith('*'):
                     if line.lower().startswith('*part'):
                         part_name = line.lower().split(',')[1].split('=')[1]
-                        inst_name = part_name + '-1'
                     if line.lower().startswith('*node'):
                         node_flag = True
                     else:
@@ -94,7 +101,11 @@ class AbaqusINPModel(object):
                 if node_flag:
                     parse_list = line.split(',')
                     node_id = parse_list[0].strip()
-                    inp_node_coors_dict[(inst_name, node_id)] = [float(item) for item in parse_list[1:]]
+                    inst_name = part_name + '-1'
+                    node_x = float(parse_list[1])
+                    node_y = float(parse_list[2])
+                    node_z = float(parse_list[3])
+                    inp_node_coors_dict[self.keygen.get_id((inst_name, node_id))] = NodeData(node_id, node_x, node_y, node_z, instname=inst_name)
         return inp_node_coors_dict
 
     def run_inp(self, inp_name, odb_name):
@@ -108,8 +119,9 @@ class AbaqusINPModel(object):
         print 'Solve Done'
 
 
-class AbaqusODBModel(object):
+class AbaqusODBModel(AbaqusModel):
     def __init__(self, odb_filepath):
+        super(AbaqusODBModel, self).__init__()
         self._odb_filepath = odb_filepath
         self._odb = None
 
@@ -117,35 +129,115 @@ class AbaqusODBModel(object):
         import odbAccess
         self._odb = odbAccess.openOdb(path=self._odb_filepath)
 
-    def get_result_data_with_instname(self, symbol='U'):
-        rst_disp = dict()
+    def get_result_data_by_symbol(self, symbol='U'):
+        rst_dict = dict()
         for step_name in self._odb.steps.keys():
             last_frame = self._odb.steps[step_name].frames[-1]
-            displacement = last_frame.fieldOutputs[symbol]
-            for value in displacement.values:
+            rst = last_frame.fieldOutputs[symbol]
+            for value in rst.values:
                 inst_name = value.instance.name
-                disp_x = value.data[0]
-                disp_y = value.data[1]
-                disp_z = value.data[2]
-                rst_disp[(inst_name.lower(), str(value.nodeLabel))] = [value.nodeLabel, disp_x, disp_y, disp_z]
-        return rst_disp
+                node_id = str(value.nodeLabel)
+                comp_x = value.data[0]
+                comp_y = value.data[1]
+                comp_z = value.data[2]
+                rst_dict[self.keygen.get_id((inst_name.lower(), node_id))] = NodeData(node_id, comp_x, comp_y, comp_z, instname=inst_name)
+        return rst_dict
 
-    def get_node_coors_dict_with_instname(self):
+    def get_node_coors_dict(self):
         insts = self._odb.rootAssembly.instances
         odb_node_coors = dict()
         for inst_name, nodes_data in insts.items():
             for node in nodes_data.nodes:
-                node_id = node.label
+                node_id = str(node.label)
                 node_x = node.coordinates[0]
                 node_y = node.coordinates[1]
                 node_z = node.coordinates[2]
-                odb_node_coors[(inst_name.lower(), str(node_id))] = [node_id, node_x, node_y, node_z]
+                odb_node_coors[self.keygen.get_id((inst_name.lower(), node_id))] = NodeData(node_id, node_x, node_y, node_z, instname=inst_name)
         return odb_node_coors
 
+    def get_deformed_node_coors(self):
+        rst_dict = self.get_result_data_by_symbol()
+        odb_node_coors_dict = self.get_node_coors_dict()
+        deformed_node_coors_dict = dict()
+        for key, value in rst_dict.items():
+            node_id = value.id
+            inst_name = value.instname
+            node_x = odb_node_coors_dict[key].x + value.x
+            node_y = odb_node_coors_dict[key].y + value.y
+            node_z = odb_node_coors_dict[key].z + value.z
+            deformed_node_coors_dict[key] = NodeData(node_id, node_x, node_y, node_z, instname=inst_name)
+        return deformed_node_coors_dict
 
-def loop(init_inp_file, dist_odb_file):
+
+class NodeData(object):
+    def __init__(self, id, x, y, z, partname=None, instname=None):
+        self._id = id
+        self._x = x
+        self._y = y
+        self._z = z
+        self._partname = partname
+        self._instname = instname
+
+    @property
+    def id(self):
+        return self._id
+
+    @property
+    def x(self):
+        return self._x
+
+    @property
+    def y(self):
+        return self._y
+
+    @property
+    def z(self):
+        return self._z
+
+    @property
+    def instname(self):
+        return self._instname
+
+    @property
+    def partname(self):
+        return self._partname
+
+
+class IdGenerator(object):
+    def __init__(self, start=1):
+        self._dic_uuid_id = dict()
+        self._set_ids = set()
+        self._max_id = start-1
+
+    def get_id(self, uuid, default=None):
+        if uuid in self._dic_uuid_id:
+            return self._dic_uuid_id[uuid]
+
+        newid = None
+        try:
+            newid = int(uuid)
+        except:
+            if default is not None:
+                try:
+                    newid = int(default)
+                except:
+                    pass
+
+        if newid is None or newid in self._set_ids:
+            newid = self._max_id + 1
+
+        self._dic_uuid_id[uuid] = newid
+        self._set_ids.add(newid)
+
+        self._max_id = max(self._max_id, newid)
+        return self._dic_uuid_id[uuid]
+
+
+def loop(init_inp_file, dist_inp_file):
     # iter
-    dist_node_coors_dict = get_node_coor_dict_by_odb(dist_odb_file)
+    dist_inp_model = AbaqusINPModel(dist_inp_file)
+    dist_inp_model.set_up()
+    dist_node_coors_dict = dist_inp_model.get_inp_node_coors_dict()
 
     inp_model = AbaqusINPModel(init_inp_file)
     inp_model.set_up()
@@ -156,8 +248,11 @@ def loop(init_inp_file, dist_odb_file):
         if count == 50:
             break
         tmp_odb_filepath = inp_model.get_new_odb_filepath()
-        tmp_node_coors_dict = get_node_coor_dict_by_odb(tmp_odb_filepath)
-        rst_data = compare_dicts(tmp_node_coors_dict, dist_node_coors_dict)
+        odb = AbaqusODBModel(tmp_odb_filepath)
+        odb.set_up()
+        inp_node_coors_dict = odb.get_node_coors_dict()
+        tmp_node_coors_dict = odb.get_deformed_node_coors()
+        rst_data = compare_dicts(inp_node_coors_dict, tmp_node_coors_dict, dist_node_coors_dict)
         if isinstance(rst_data, bool):
             print count
             break
@@ -171,28 +266,24 @@ def loop(init_inp_file, dist_odb_file):
         count += 1
 
 
-def get_node_coor_dict_by_odb(odb_filepath):
-    odb = AbaqusODBModel(odb_filepath)
-    odb.set_up()
-    return odb.get_node_coors_dict_with_instname()
-
-
-def compare_dicts(src_dict, dist_dict, alpha=0.2, error=1e-3):
+def compare_dicts(inp_node_dict, src_dict, dist_dict, alpha=0.2, error=1e-3):
     new_node_data = {}
     convergence_data_list = []
 
     for key, value in dist_dict.items():
-        distance_value = calculate_distance_between_two_point(value, src_dict[key])
+        distance_value = calculate_distance_between_two_node(value, src_dict[key])
         convergence_data_list.append(distance_value)
 
-        diff_x = value[1] - src_dict[key][1]
-        diff_y = value[2] - src_dict[key][2]
-        diff_z = value[3] - src_dict[key][3]
-        node_x = src_dict[key][1] + alpha * diff_x
-        node_y = src_dict[key][2] + alpha * diff_y
-        node_z = src_dict[key][3] + alpha * diff_z
+        node_id = value.id
+        inst_name = value.instname
+        diff_x = value.x - src_dict[key].x
+        diff_y = value.y - src_dict[key].y
+        diff_z = value.z - src_dict[key].z
+        node_x = inp_node_dict[key].x + alpha * diff_x
+        node_y = inp_node_dict[key].y + alpha * diff_y
+        node_z = inp_node_dict[key].z + alpha * diff_z
 
-        new_node_data[key] = [key[1], node_x, node_y, node_z]
+        new_node_data[key] = NodeData(node_id, node_x, node_y, node_z, instname=inst_name)
 
     convergence_data_list.sort(reverse=True)
     max_convergence_data_list = convergence_data_list[0:20]
@@ -205,17 +296,16 @@ def compare_dicts(src_dict, dist_dict, alpha=0.2, error=1e-3):
     return [convergence_value, new_node_data]
 
 
-def calculate_distance_between_two_point(point1, point2):
-    import math
-    return math.sqrt(math.pow((point1[1]-point2[1]), 2) +
-                     math.pow((point1[2]-point2[2]), 2) +
-                     math.pow((point1[3]-point2[3]), 2))
+def calculate_distance_between_two_node(node1, node2):
+    return math.sqrt(math.pow((node1.x-node2.x), 2) +
+                     math.pow((node1.y-node2.y), 2) +
+                     math.pow((node1.z-node2.z), 2))
 
 
 if __name__ == "__main__":
-    init_inp_file = 'E:/SIMULIA/6.14/Temp/iter/blade_init.inp'
-    dist_odb_file = 'E:/SIMULIA/6.14/Temp/iter/blade_code_dist.odb'
-    loop(init_inp_file, dist_odb_file)
+    init_inp_file = 'E:/SIMULIA/6.14/Temp/iter_test/blade_init.inp'
+    dist_inp_file = 'E:/SIMULIA/6.14/Temp/iter_test/blade_code_dist.inp'
+    loop(init_inp_file, dist_inp_file)
 
 
 
