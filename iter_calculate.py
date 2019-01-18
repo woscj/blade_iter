@@ -165,7 +165,7 @@ class AbaqusODBModel(AbaqusModel):
             node_x = odb_node_coors_dict[key].x + value.x
             node_y = odb_node_coors_dict[key].y + value.y
             node_z = odb_node_coors_dict[key].z + value.z
-            deformed_node_coors_dict[key] = NodeData(node_id, node_x, node_y, node_z, instname=inst_name)
+            deformed_node_coors_dict[self.keygen.get_id((inst_name.lower(), node_id))] = NodeData(node_id, node_x, node_y, node_z, instname=inst_name)
         return deformed_node_coors_dict
 
 
@@ -233,80 +233,88 @@ class IdGenerator(object):
         return self._dic_uuid_id[uuid]
 
 
-def loop(init_inp_file, dist_inp_file):
-    # iter
-    dist_inp_model = AbaqusINPModel(dist_inp_file)
-    dist_inp_model.set_up()
-    dist_node_coors_dict = dist_inp_model.get_inp_node_coors_dict()
+class Calculate(object):
+    def __init__(self, init_inp_file, dist_inp_file):
+        self._init_inp_file = init_inp_file
+        self._dist_inp_file = dist_inp_file
+        self._dist_node_coors_dict = dict()
+        self._new_node_coors_dict = dict()
+        self._is_same = False
+        self._convergence_value = 0.0
 
-    inp_model = AbaqusINPModel(init_inp_file)
-    inp_model.set_up()
+    def loop(self, iter_max_step=200):
 
-    count = 1
-    inp_model.run_inp('blade_init', 'blade_init')
-    while True:
-        if count == 50:
-            break
-        tmp_odb_filepath = inp_model.get_new_odb_filepath()
-        odb = AbaqusODBModel(tmp_odb_filepath)
-        odb.set_up()
-        inp_node_coors_dict = odb.get_node_coors_dict()
-        tmp_node_coors_dict = odb.get_deformed_node_coors()
-        rst_data = compare_dicts(inp_node_coors_dict, tmp_node_coors_dict, dist_node_coors_dict)
-        if isinstance(rst_data, bool):
-            print count
-            break
-        assert isinstance(rst_data, list)
-        convergence_value = rst_data[0]
-        print convergence_value
-        node_data_dict = rst_data[1]
-        filename = 'iter_%d' % count
-        inp_model.generate_inp_from_node_coors_dict(filename, node_data_dict)
-        inp_model.run_inp(inp_name=filename, odb_name=filename)
-        count += 1
+        dist_inp_model = AbaqusINPModel(self._dist_inp_file)
+        dist_inp_model.set_up()
+        self._dist_node_coors_dict = dist_inp_model.get_inp_node_coors_dict()
 
+        # iter
+        inp_model = AbaqusINPModel(self._init_inp_file)
+        inp_model.set_up()
+        inp_filename = inp_model.get_filename()
+        inp_model.run_inp(inp_filename, 'init')
 
-def compare_dicts(inp_node_dict, src_dict, dist_dict, alpha=0.2, error=1e-3):
-    new_node_data = {}
-    convergence_data_list = []
+        count = 1
+        while True:
+            if count > iter_max_step:
+                break
+            iter_odb_filepath = inp_model.get_new_odb_filepath()
+            iter_odb = AbaqusODBModel(iter_odb_filepath)
+            iter_odb.set_up()
+            cur_inp_node_coors_dict = iter_odb.get_node_coors_dict()
+            deformed_node_coors_dict = iter_odb.get_deformed_node_coors()
+            self.update_node_dict(cur_inp_node_coors_dict, deformed_node_coors_dict)
+            if self._is_same:
+                break
+            print self._convergence_value
+            filename = 'iter_%d' % count
+            inp_model.generate_inp_from_node_coors_dict(filename, self._new_node_coors_dict)
+            inp_model.run_inp(inp_name=filename, odb_name=filename)
+            count += 1
 
-    for key, value in dist_dict.items():
-        distance_value = calculate_distance_between_two_node(value, src_dict[key])
-        convergence_data_list.append(distance_value)
+    def update_node_dict(self, cur_inp_node_coors_dict, deformed_node_coors_dict, alpha=0.08, error=1e-3):
+        nodes_distance_data_list = []
 
-        node_id = value.id
-        inst_name = value.instname
-        diff_x = value.x - src_dict[key].x
-        diff_y = value.y - src_dict[key].y
-        diff_z = value.z - src_dict[key].z
-        node_x = inp_node_dict[key].x + alpha * diff_x
-        node_y = inp_node_dict[key].y + alpha * diff_y
-        node_z = inp_node_dict[key].z + alpha * diff_z
+        for key, dist_node_data in self._dist_node_coors_dict.items():
+            deformed_node_data = deformed_node_coors_dict[key]
+            distance_value = self.calculate_distance_between_two_nodes(dist_node_data, deformed_node_data)
+            nodes_distance_data_list.append(distance_value)
 
-        new_node_data[key] = NodeData(node_id, node_x, node_y, node_z, instname=inst_name)
+            node_id = dist_node_data.id
+            inst_name = dist_node_data.instname
+            diff_x = dist_node_data.x - deformed_node_data.x
+            diff_y = dist_node_data.y - deformed_node_data.y
+            diff_z = dist_node_data.z - deformed_node_data.z
+            if node_id == '18208':
+                print dist_node_data.x, dist_node_data.y, dist_node_data.z
+                print deformed_node_data.x, deformed_node_data.y, deformed_node_data.z
+                print diff_x, diff_y, diff_z
+            node_x = cur_inp_node_coors_dict[key].x + alpha * diff_x
+            node_y = cur_inp_node_coors_dict[key].y + alpha * diff_y
+            node_z = cur_inp_node_coors_dict[key].z + alpha * diff_z
 
-    convergence_data_list.sort(reverse=True)
-    max_convergence_data_list = convergence_data_list[0:20]
+            self._new_node_coors_dict[key] = NodeData(node_id, node_x, node_y, node_z, instname=inst_name)
 
-    if max_convergence_data_list[0] <= error:
-        return True
+        nodes_distance_data_list.sort(reverse=True)
+        max_nodes_distance_data_list = nodes_distance_data_list[0:20]
 
-    convergence_value = sum(max_convergence_data_list) / len(max_convergence_data_list)
+        if max_nodes_distance_data_list[0] <= error:
+            self._is_same = True
 
-    return [convergence_value, new_node_data]
+        self._convergence_value = sum(max_nodes_distance_data_list) / len(max_nodes_distance_data_list)
 
-
-def calculate_distance_between_two_node(node1, node2):
-    return math.sqrt(math.pow((node1.x-node2.x), 2) +
-                     math.pow((node1.y-node2.y), 2) +
-                     math.pow((node1.z-node2.z), 2))
+    def calculate_distance_between_two_nodes(self, node1, node2):
+        return math.sqrt(math.pow((node1.x - node2.x), 2) +
+                         math.pow((node1.y - node2.y), 2) +
+                         math.pow((node1.z - node2.z), 2))
 
 
 if __name__ == "__main__":
-    init_inp_file = 'E:/SIMULIA/6.14/Temp/iter_test/blade_init.inp'
-    dist_inp_file = 'E:/SIMULIA/6.14/Temp/iter_test/blade_code_dist.inp'
-    loop(init_inp_file, dist_inp_file)
+    init_inp_file = 'E:/SIMULIA/6.14/Temp/iter_all/blade_init.inp'
+    dist_inp_file = 'E:/SIMULIA/6.14/Temp/iter_all/blade_code_dist.inp'
 
+    cal = Calculate(init_inp_file, dist_inp_file)
+    cal.loop()
 
 
 
